@@ -1,0 +1,13 @@
+{
+  "name": "laff-paystack-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {"start": "node server.js"},
+  "engines": {"node": ">=20"},
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.0",
+    "express": "^5.1.0",
+    "cors": "^2.8.5"
+  }
+}
