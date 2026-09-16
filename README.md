@@ -1,6 +1,6 @@
 # Laff British School — Paystack Backend
 
-This service keeps the Paystack secret key on the server and exposes a small API for the student portal.
+This service keeps the Paystack secret key on the server. Paystack handles checkout and transaction verification first; Supabase is used afterward to record successful student payments and publish/fetch receipts.
 
 ## Render setup
 
@@ -22,25 +22,58 @@ Add these environment variables in Render. Do **not** commit the real values to 
 
 - `PAYSTACK_SECRET_KEY` — your Paystack secret key
 - `SUPABASE_URL` — Supabase project URL
-- `SUPABASE_ANON_KEY` — Supabase anon/publishable key
-- `SUPABASE_SERVICE_ROLE_KEY` — Supabase service-role key
+- `SUPABASE_ANON_KEY` — Supabase anon/publishable key, used only for authenticated receipt access
+- `SUPABASE_SERVICE_ROLE_KEY` — Supabase service-role key for server-side payment/receipt records
 - `APP_URL` — the public student portal URL
 - `PORT` — Render provides this automatically; the app defaults to `10000`
+
+## Payment flow
+
+1. The portal sends the payment email, amount, and service code to `/payments/initialize`.
+2. The backend calls Paystack first and returns the Paystack `access_code` / `authorization_url`.
+3. After checkout, `/payments/verify` verifies the reference directly with Paystack first.
+4. Only after Paystack confirms a successful NGN transaction does the backend write the `PAID` record to Supabase.
+5. The existing Supabase receipt trigger publishes the student payment receipt.
+6. `/payments/receipt` can fetch that published receipt for the authenticated student.
 
 ## Endpoints
 
 `GET /health` — service health check.
 
-`POST /payments/initialize` — authenticates the student with Supabase, validates the configured service amount, initializes a Paystack transaction, and stores a pending payment in Supabase.
+`POST /payments/initialize` — starts a Paystack transaction. It does not require Supabase authentication.
 
-`POST /payments/verify` — verifies a transaction against Paystack and marks the Supabase payment `PAID` only when Paystack confirms success and the amount/currency are correct.
+Request example:
 
-`POST /webhooks/paystack` — verifies Paystack's `x-paystack-signature` and records successful `charge.success` events in Supabase.
-
-The webhook is the server-to-server payment confirmation path. Configure the Paystack webhook URL as:
-
-```text
-https://YOUR-RENDER-SERVICE.onrender.com/webhooks/paystack
+```json
+{
+  "email": "student@example.com",
+  "amount": 1000,
+  "service_code": "RESULT_ACCESS",
+  "title": "Result Access",
+  "student_id": "optional-supabase-student-id"
+}
 ```
 
-Use the Render service URL in your student portal's payment configuration. Never expose `PAYSTACK_SECRET_KEY` in browser JavaScript.
+`POST /payments/verify` — verifies the transaction with Paystack first, then syncs the successful payment into Supabase.
+
+Request example:
+
+```json
+{
+  "reference": "LBS-RESULT_ACCESS-xxxx",
+  "service_code": "RESULT_ACCESS",
+  "student_id": "supabase-student-id"
+}
+```
+
+`POST /payments/receipt` — authenticated endpoint that fetches the published Supabase receipt for the signed-in student and payment reference.
+
+`POST /webhooks/paystack` — verifies Paystack's `x-paystack-signature` and records successful `charge.success` events in Supabase when a matching payment record exists.
+
+Configure the Paystack webhook URL as:
+
+```text
+https://paystack-backend-c6hb.onrender.com/webhooks/paystack
+```
+
+Never expose `PAYSTACK_SECRET_KEY` in browser JavaScript.
