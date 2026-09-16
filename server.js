@@ -156,8 +156,16 @@ async function syncSuccessfulPayment({ reference, transaction, student_id, servi
 
 async function fetchReceipt(reference, student_id) {
   if (!supabase || !reference) return null;
-  let query = supabase.from('student_payment_receipts').select('*').eq('payment_reference', reference);
+
+  // student_payment_receipts uses the column name `reference`, not
+  // `payment_reference`.
+  let query = supabase
+    .from('student_payment_receipts')
+    .select('*')
+    .eq('reference', reference);
+
   if (student_id) query = query.eq('student_id', student_id);
+
   const { data, error } = await query.maybeSingle();
   if (error) throw error;
   return data || null;
@@ -166,8 +174,6 @@ async function fetchReceipt(reference, student_id) {
 app.get('/', (_req, res) => res.json({ service: 'Laff British School Paystack Backend', status: 'ok' }));
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-// Paystack sends the webhook with a raw JSON body. Keep this route before
-// express.json() so the HMAC signature is calculated from the exact body.
 app.post('/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
   if (!requirePaystack(res)) return;
   try {
@@ -209,9 +215,6 @@ app.post('/webhooks/paystack', express.raw({ type: 'application/json' }), async 
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
-// Paystack is the first payment call. Supabase sync happens only after
-// Paystack accepts the transaction, and no callback redirect is used for
-// Popup V2. The browser keeps control of the checkout page.
 app.post('/payments/initialize', async (req, res) => {
   if (!requirePaystack(res)) return;
   try {
