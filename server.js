@@ -8,6 +8,7 @@ const app = express();
 const PORT = Number(process.env.PORT || 10000);
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const APP_URL = process.env.APP_URL || '';
 
@@ -22,7 +23,7 @@ const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
 const serviceCode = (code) => code === 'ID_CARD_ACCESS' ? 'ID_CARD' : String(code || '');
 
 function requireConfig(res) {
-  if (!PAYSTACK_SECRET_KEY || !supabase) {
+  if (!PAYSTACK_SECRET_KEY || !supabase || !SUPABASE_URL) {
     res.status(503).json({ error: 'Payment backend is not configured.' });
     return false;
   }
@@ -38,7 +39,7 @@ async function paystack(path, options = {}) {
       ...(options.headers || {})
     }
   });
-  const payload = await response.json();
+  const payload = await response.json().catch(() => ({}));
   return { response, payload };
 }
 
@@ -47,7 +48,7 @@ async function getStudent(req) {
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
   if (!token) return { error: 'Authentication required.' };
 
-  const userClient = createClient(SUPABASE_URL, process.env.SUPABASE_ANON_KEY || '', {
+  const userClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY || '', {
     global: { headers: { Authorization: auth } },
     auth: { persistSession: false }
   });
@@ -68,12 +69,12 @@ async function getStudent(req) {
 app.get('/', (_req, res) => res.json({ service: 'Laff British School Paystack Backend', status: 'ok' }));
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-// Paystack signs webhooks with the exact raw request body, so this route must
-// receive the body before the global JSON parser is applied.
+// Paystack must be given the exact raw request body for signature verification.
+// Keep this route before the JSON parser below.
 app.post('/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
   if (!requireConfig(res)) return;
   try {
-    const signature = req.headers['x-paystack-signature'];
+    const signature = String(req.headers['x-paystack-signature'] || '');
     const expected = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY).update(req.body).digest('hex');
     if (!signature || signature !== expected) return res.status(401).json({ error: 'Invalid signature.' });
 
@@ -118,7 +119,9 @@ app.post('/payments/initialize', async (req, res) => {
   try {
     const { service_code: rawCode, title } = req.body || {};
     const code = serviceCode(rawCode);
-    if (!['RESULT_ACCESS', 'ID_CARD'].includes(code)) return res.status(400).json({ error: 'Invalid service.' });
+    if (!['RESULT_ACCESS', 'ID_CARD'].includes(code)) {
+      return res.status(400).json({ error: 'Invalid service.' });
+    }
 
     const studentResult = await getStudent(req);
     if (studentResult.error) return res.status(401).json({ error: studentResult.error });
@@ -133,8 +136,8 @@ app.post('/payments/initialize', async (req, res) => {
     if (settingError) return res.status(500).json({ error: settingError.message });
     if (!setting?.is_active) return res.status(400).json({ error: 'This service is not currently available.' });
 
-    // The server is the source of truth for the price. The browser does not
-    // send an amount, so a modified client cannot change the configured price.
+    // The server is the source of truth for pricing. The browser does not send
+    // an amount, so clients cannot change the configured service price.
     const requestedAmount = Number(setting.amount);
     if (!Number.isFinite(requestedAmount) || requestedAmount <= 0) {
       return res.status(500).json({ error: 'This service has an invalid configured payment amount.' });
@@ -173,7 +176,9 @@ app.post('/payments/initialize', async (req, res) => {
       })
     });
 
-    if (!response.ok || !payload.status) return res.status(502).json({ error: payload.message || 'Paystack initialization failed.' });
+    if (!response.ok || !payload.status) {
+      return res.status(502).json({ error: payload.message || 'Paystack initialization failed.' });
+    }
 
     const { error: insertError } = await supabase.from('student_service_payments').insert({
       student_id: student.id,
@@ -185,7 +190,8 @@ app.post('/payments/initialize', async (req, res) => {
       provider: 'PAYSTACK',
       metadata: {
         access_code: payload.data?.access_code || null,
-        authorization_url: payload.data?.authorization_url || null
+        authorization_url: payload.data?.authorization_url || null,
+        paystack_reference: payload.data?.reference || reference
       }
     });
     if (insertError) return res.status(500).json({ error: insertError.message });
