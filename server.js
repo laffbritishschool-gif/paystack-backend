@@ -156,16 +156,8 @@ async function syncSuccessfulPayment({ reference, transaction, student_id, servi
 
 async function fetchReceipt(reference, student_id) {
   if (!supabase || !reference) return null;
-
-  // student_payment_receipts uses the column name `reference`, not
-  // `payment_reference`.
-  let query = supabase
-    .from('student_payment_receipts')
-    .select('*')
-    .eq('reference', reference);
-
+  let query = supabase.from('student_payment_receipts').select('*').eq('reference', reference);
   if (student_id) query = query.eq('student_id', student_id);
-
   const { data, error } = await query.maybeSingle();
   if (error) throw error;
   return data || null;
@@ -243,9 +235,7 @@ app.post('/payments/initialize', async (req, res) => {
       })
     });
 
-    if (!response.ok || !payload.status) {
-      return res.status(502).json({ error: payload.message || 'Paystack initialization failed.' });
-    }
+    if (!response.ok || !payload.status) return res.status(502).json({ error: payload.message || 'Paystack initialization failed.' });
 
     let supabase_synced = false;
     try {
@@ -290,12 +280,29 @@ app.post('/payments/verify', async (req, res) => {
     if (!ref) return res.status(400).json({ error: 'Payment reference is required.' });
     if (!allowedServices.has(code)) return res.status(400).json({ error: 'Invalid service.' });
 
+    let pendingAmount = null;
+    if (supabase) {
+      const { data: pending, error: pendingError } = await supabase
+        .from('student_service_payments')
+        .select('amount,student_id,service_code,status')
+        .eq('reference', ref)
+        .maybeSingle();
+      if (pendingError) return res.status(500).json({ error: pendingError.message });
+      if (pending) {
+        pendingAmount = Number(pending.amount);
+        if (student_id && pending.student_id !== student_id) return res.status(403).json({ error: 'Payment does not belong to this student.' });
+        if (pending.service_code !== code) return res.status(400).json({ error: 'Payment service does not match.' });
+      }
+    }
+
     const { response, payload } = await paystack(`/transaction/verify/${encodeURIComponent(ref)}`);
     const transaction = payload?.data || {};
     const paystackStatus = String(transaction.status || '').toLowerCase();
-    const amountOk = Number(transaction.amount) > 0;
+    const receivedAmount = Number(transaction.amount);
+    const expectedKobo = Number.isFinite(pendingAmount) ? Math.round(pendingAmount * 100) : null;
+    const amountOk = expectedKobo === null ? receivedAmount > 0 : receivedAmount >= expectedKobo;
     const success = response.ok && payload.status === true && paystackStatus === 'success' && amountOk && transaction.currency === 'NGN';
-    const terminalFailure = ['failed', 'abandoned', 'reversed'].includes(paystackStatus);
+    const terminalFailure = ['failed', 'reversed'].includes(paystackStatus);
 
     if (!success) {
       return res.json({
@@ -305,28 +312,16 @@ app.post('/payments/verify', async (req, res) => {
         paystack_status: paystackStatus || null,
         gateway_response: transaction.gateway_response || null,
         response_code: transaction.response_code || null,
+        amount_ok: amountOk,
         supabase_synced: false,
         receipt_published: false
       });
     }
 
-    const synced = await syncSuccessfulPayment({
-      reference: ref,
-      transaction,
-      student_id,
-      service_code: code
-    });
-
+    const synced = await syncSuccessfulPayment({ reference: ref, transaction, student_id, service_code: code });
     const receipt = await fetchReceipt(ref, student_id);
 
-    res.json({
-      paid: true,
-      reference: ref,
-      status: 'PAID',
-      supabase_synced: synced.synced,
-      receipt_published: synced.receipt_published,
-      receipt
-    });
+    res.json({ paid: true, reference: ref, status: 'PAID', supabase_synced: synced.synced, receipt_published: synced.receipt_published, receipt });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: error.message || 'Could not verify payment.' });
