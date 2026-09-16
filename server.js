@@ -4,12 +4,11 @@ import crypto from 'node:crypto';
 import { createClient } from '@supabase/supabase-js';
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: '1mb' }));
 
 const PORT = Number(process.env.PORT || 10000);
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const APP_URL = process.env.APP_URL || '';
 
@@ -22,6 +21,9 @@ const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
   : null;
 
 const serviceCode = (code) => code === 'ID_CARD_ACCESS' ? 'ID_CARD' : String(code || '');
+
+const allowedOrigin = APP_URL ? APP_URL.replace(/\/$/, '') : true;
+app.use(cors({ origin: allowedOrigin, credentials: false }));
 
 function requireConfig(res) {
   if (!PAYSTACK_SECRET_KEY || !supabase) {
@@ -49,7 +51,8 @@ async function getStudent(req) {
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
   if (!token) return { error: 'Authentication required.' };
 
-  const userClient = createClient(SUPABASE_URL, process.env.SUPABASE_ANON_KEY || '', {
+  if (!SUPABASE_ANON_KEY) return { error: 'Supabase authentication is not configured.' };
+  const userClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
     global: { headers: { Authorization: auth } },
     auth: { persistSession: false }
   });
@@ -70,6 +73,45 @@ async function getStudent(req) {
 app.get('/', (_req, res) => res.json({ service: 'Laff British School Paystack Backend', status: 'ok' }));
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
+app.post('/webhooks/paystack', express.raw({ type: 'application/json', limit: '1mb' }), async (req, res) => {
+  if (!requireConfig(res)) return;
+  try {
+    const signature = String(req.headers['x-paystack-signature'] || '');
+    const expected = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY).update(req.body).digest('hex');
+    if (!signature || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+      return res.status(401).json({ error: 'Invalid signature.' });
+    }
+
+    const event = JSON.parse(req.body.toString('utf8'));
+    if (event?.event === 'charge.success' && event?.data?.reference) {
+      const reference = String(event.data.reference);
+      const { data: payment } = await supabase
+        .from('student_service_payments')
+        .select('id,amount,student_id,service_code,metadata')
+        .eq('reference', reference)
+        .maybeSingle();
+
+      if (payment) {
+        const amountOk = Number(event.data.amount) >= Math.round(Number(payment.amount) * 100);
+        if (amountOk && event.data.currency === 'NGN') {
+          await supabase.from('student_service_payments').update({
+            status: 'PAID',
+            paid_at: new Date().toISOString(),
+            metadata: { ...(payment.metadata || {}), paystack: event.data, webhook_received_at: new Date().toISOString(), verified: true }
+          }).eq('id', payment.id);
+        }
+      }
+    }
+
+    res.json({ received: true });
+  } catch (error) {
+    console.error(error);
+    res.status(400).json({ error: 'Webhook processing failed.' });
+  }
+});
+
+app.use(express.json({ limit: '1mb' }));
+
 app.post('/payments/initialize', async (req, res) => {
   if (!requireConfig(res)) return;
   try {
@@ -83,12 +125,13 @@ app.post('/payments/initialize', async (req, res) => {
     if (studentResult.error) return res.status(401).json({ error: studentResult.error });
     const { user, student } = studentResult;
 
-    const { data: setting } = await supabase
+    const { data: setting, error: settingError } = await supabase
       .from('student_service_settings')
       .select('title,amount,is_active')
       .eq('service_code', code)
       .maybeSingle();
 
+    if (settingError) return res.status(500).json({ error: settingError.message });
     if (!setting?.is_active) return res.status(400).json({ error: 'This service is not currently available.' });
     if (Number(setting.amount) !== requestedAmount) return res.status(400).json({ error: 'Payment amount does not match the configured service amount.' });
 
@@ -213,41 +256,6 @@ app.post('/payments/verify', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Could not verify payment.' });
-  }
-});
-
-app.post('/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
-  if (!requireConfig(res)) return;
-  try {
-    const signature = req.headers['x-paystack-signature'];
-    const expected = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY).update(req.body).digest('hex');
-    if (!signature || signature !== expected) return res.status(401).json({ error: 'Invalid signature.' });
-
-    const event = JSON.parse(req.body.toString('utf8'));
-    if (event?.event === 'charge.success' && event?.data?.reference) {
-      const reference = String(event.data.reference);
-      const { data: payment } = await supabase
-        .from('student_service_payments')
-        .select('id,amount,student_id,service_code,metadata')
-        .eq('reference', reference)
-        .maybeSingle();
-
-      if (payment) {
-        const amountOk = Number(event.data.amount) >= Math.round(Number(payment.amount) * 100);
-        if (amountOk && event.data.currency === 'NGN') {
-          await supabase.from('student_service_payments').update({
-            status: 'PAID',
-            paid_at: new Date().toISOString(),
-            metadata: { ...(payment.metadata || {}), paystack: event.data, webhook_received_at: new Date().toISOString(), verified: true }
-          }).eq('id', payment.id);
-        }
-      }
-    }
-
-    res.json({ received: true });
-  } catch (error) {
-    console.error(error);
-    res.status(400).json({ error: 'Webhook processing failed.' });
   }
 });
 
