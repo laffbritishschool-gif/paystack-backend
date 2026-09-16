@@ -155,11 +155,18 @@ async function syncSuccessfulPayment({ reference, transaction, student_id, servi
   return { synced: true, receipt_published: true, payment_id: paymentId };
 }
 
+async function fetchReceipt(reference, student_id) {
+  if (!supabase || !reference) return null;
+  let query = supabase.from('student_payment_receipts').select('*').eq('payment_reference', reference);
+  if (student_id) query = query.eq('student_id', student_id);
+  const { data, error } = await query.maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
 app.get('/', (_req, res) => res.json({ service: 'Laff British School Paystack Backend', status: 'ok' }));
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-// Paystack sends the webhook with a raw JSON body. Keep this route before
-// express.json() so the HMAC signature is calculated from the exact body.
 app.post('/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
   if (!requirePaystack(res)) return;
   try {
@@ -201,9 +208,6 @@ app.post('/webhooks/paystack', express.raw({ type: 'application/json' }), async 
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
-// Paystack is the first call here. Supabase is only touched after Paystack
-// has accepted the transaction, so checkout initialization is not blocked by
-// Supabase authentication.
 app.post('/payments/initialize', async (req, res) => {
   if (!requirePaystack(res)) return;
   try {
@@ -233,9 +237,7 @@ app.post('/payments/initialize', async (req, res) => {
       })
     });
 
-    if (!response.ok || !payload.status) {
-      return res.status(502).json({ error: payload.message || 'Paystack initialization failed.' });
-    }
+    if (!response.ok || !payload.status) return res.status(502).json({ error: payload.message || 'Paystack initialization failed.' });
 
     let supabase_synced = false;
     try {
@@ -271,8 +273,6 @@ app.post('/payments/initialize', async (req, res) => {
   }
 });
 
-// Verify with Paystack first. Only after Paystack confirms success do we write
-// the PAID record that triggers the Supabase receipt publication.
 app.post('/payments/verify', async (req, res) => {
   if (!requirePaystack(res)) return;
   try {
@@ -307,12 +307,15 @@ app.post('/payments/verify', async (req, res) => {
       service_code: code
     });
 
+    const receipt = await fetchReceipt(ref, student_id);
+
     res.json({
       paid: true,
       reference: ref,
       status: 'PAID',
       supabase_synced: synced.synced,
-      receipt_published: synced.receipt_published
+      receipt_published: synced.receipt_published,
+      receipt
     });
   } catch (error) {
     console.error(error);
@@ -320,8 +323,6 @@ app.post('/payments/verify', async (req, res) => {
   }
 });
 
-// Fetch the published Supabase receipt only for the currently authenticated
-// student. This keeps receipt retrieval behind the student's Supabase session.
 app.post('/payments/receipt', async (req, res) => {
   try {
     if (!supabase) return res.status(503).json({ error: 'Supabase receipt service is not configured.' });
@@ -331,14 +332,7 @@ app.post('/payments/receipt', async (req, res) => {
     const reference = String(req.body?.reference || '').trim();
     if (!reference) return res.status(400).json({ error: 'Payment reference is required.' });
 
-    const { data: receipt, error } = await supabase
-      .from('student_payment_receipts')
-      .select('*')
-      .eq('student_id', studentResult.student.id)
-      .eq('payment_reference', reference)
-      .maybeSingle();
-
-    if (error) return res.status(500).json({ error: error.message });
+    const receipt = await fetchReceipt(reference, studentResult.student.id);
     if (!receipt) return res.status(404).json({ error: 'Payment receipt not found.' });
 
     res.json({ receipt });
