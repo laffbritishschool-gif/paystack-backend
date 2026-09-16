@@ -8,23 +8,23 @@ const app = express();
 const PORT = Number(process.env.PORT || 10000);
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const APP_URL = process.env.APP_URL || '';
 
-if (!PAYSTACK_SECRET_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.warn('Missing one or more required Render environment variables.');
-}
+if (!PAYSTACK_SECRET_KEY) console.warn('Missing PAYSTACK_SECRET_KEY.');
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) console.warn('Supabase receipt sync is not configured.');
 
 const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
   : null;
 
 const serviceCode = (code) => code === 'ID_CARD_ACCESS' ? 'ID_CARD' : String(code || '');
+const allowedServices = new Set(['RESULT_ACCESS', 'ID_CARD']);
 
-function requireConfig(res) {
-  if (!PAYSTACK_SECRET_KEY || !supabase || !SUPABASE_URL) {
-    res.status(503).json({ error: 'Payment backend is not configured.' });
+function requirePaystack(res) {
+  if (!PAYSTACK_SECRET_KEY) {
+    res.status(503).json({ error: 'Paystack backend is not configured.' });
     return false;
   }
   return true;
@@ -43,12 +43,13 @@ async function paystack(path, options = {}) {
   return { response, payload };
 }
 
-async function getStudent(req) {
+async function getAuthenticatedStudent(req) {
+  if (!supabase || !SUPABASE_URL) return { error: 'Supabase is not configured.' };
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
   if (!token) return { error: 'Authentication required.' };
 
-  const userClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY || '', {
+  const userClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
     global: { headers: { Authorization: auth } },
     auth: { persistSession: false }
   });
@@ -66,41 +67,127 @@ async function getStudent(req) {
   return { user, student };
 }
 
+async function syncPendingPayment({ reference, service_code, student_id, amount, currency, metadata = {} }) {
+  if (!supabase || !student_id) return null;
+  const { data: existing } = await supabase
+    .from('student_service_payments')
+    .select('id')
+    .eq('reference', reference)
+    .maybeSingle();
+
+  if (existing?.id) return existing.id;
+
+  const { data, error } = await supabase
+    .from('student_service_payments')
+    .insert({
+      student_id,
+      service_code,
+      amount,
+      currency: currency || 'NGN',
+      reference,
+      status: 'PENDING',
+      provider: 'PAYSTACK',
+      metadata
+    })
+    .select('id')
+    .single();
+
+  if (error) throw error;
+  return data.id;
+}
+
+async function syncSuccessfulPayment({ reference, transaction, student_id, service_code }) {
+  if (!supabase) return { synced: false, receipt_published: false };
+
+  const amount = Number(transaction.amount) / 100;
+  const currency = transaction.currency || 'NGN';
+  const baseMetadata = {
+    paystack: transaction,
+    verified: true,
+    verified_at: new Date().toISOString()
+  };
+
+  const { data: existing } = await supabase
+    .from('student_service_payments')
+    .select('id,metadata')
+    .eq('reference', reference)
+    .maybeSingle();
+
+  let paymentId = existing?.id || null;
+
+  if (paymentId) {
+    const { error } = await supabase
+      .from('student_service_payments')
+      .update({
+        status: 'PAID',
+        amount,
+        currency,
+        service_code: service_code || undefined,
+        paid_at: new Date().toISOString(),
+        metadata: { ...(existing.metadata || {}), ...baseMetadata }
+      })
+      .eq('id', paymentId);
+    if (error) throw error;
+  } else {
+    if (!student_id || !service_code) {
+      return { synced: false, receipt_published: false, reason: 'student_id and service_code are required to publish the receipt.' };
+    }
+
+    const { data, error } = await supabase
+      .from('student_service_payments')
+      .insert({
+        student_id,
+        service_code,
+        amount,
+        currency,
+        reference,
+        status: 'PAID',
+        provider: 'PAYSTACK',
+        paid_at: new Date().toISOString(),
+        metadata: baseMetadata
+      })
+      .select('id')
+      .single();
+    if (error) throw error;
+    paymentId = data.id;
+  }
+
+  return { synced: true, receipt_published: true, payment_id: paymentId };
+}
+
 app.get('/', (_req, res) => res.json({ service: 'Laff British School Paystack Backend', status: 'ok' }));
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-// Paystack must be given the exact raw request body for signature verification.
-// Keep this route before the JSON parser below.
+// Paystack sends the webhook with a raw JSON body. Keep this route before
+// express.json() so the HMAC signature is calculated from the exact body.
 app.post('/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
-  if (!requireConfig(res)) return;
+  if (!requirePaystack(res)) return;
   try {
-    const signature = String(req.headers['x-paystack-signature'] || '');
+    const signature = req.headers['x-paystack-signature'];
     const expected = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY).update(req.body).digest('hex');
     if (!signature || signature !== expected) return res.status(401).json({ error: 'Invalid signature.' });
 
     const event = JSON.parse(req.body.toString('utf8'));
     if (event?.event === 'charge.success' && event?.data?.reference) {
       const reference = String(event.data.reference);
-      const { data: payment } = await supabase
-        .from('student_service_payments')
-        .select('id,amount,student_id,service_code,metadata')
-        .eq('reference', reference)
-        .maybeSingle();
+      const { data: payment } = supabase
+        ? await supabase.from('student_service_payments')
+            .select('id,amount,student_id,service_code,metadata')
+            .eq('reference', reference)
+            .maybeSingle()
+        : { data: null };
 
-      if (payment) {
-        const amountOk = Number(event.data.amount) >= Math.round(Number(payment.amount) * 100);
-        if (amountOk && event.data.currency === 'NGN') {
-          await supabase.from('student_service_payments').update({
-            status: 'PAID',
-            paid_at: new Date().toISOString(),
-            metadata: {
-              ...(payment.metadata || {}),
-              paystack: event.data,
-              webhook_received_at: new Date().toISOString(),
-              verified: true
-            }
-          }).eq('id', payment.id);
-        }
+      if (payment && Number(event.data.amount) >= Math.round(Number(payment.amount) * 100) && event.data.currency === 'NGN') {
+        await supabase.from('student_service_payments').update({
+          status: 'PAID',
+          paid_at: new Date().toISOString(),
+          metadata: {
+            ...(payment.metadata || {}),
+            paystack: event.data,
+            webhook_received_at: new Date().toISOString(),
+            verified: true
+          }
+        }).eq('id', payment.id);
       }
     }
 
@@ -114,63 +201,33 @@ app.post('/webhooks/paystack', express.raw({ type: 'application/json' }), async 
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
+// Paystack is the first call here. Supabase is only touched after Paystack
+// has accepted the transaction, so checkout initialization is not blocked by
+// Supabase authentication.
 app.post('/payments/initialize', async (req, res) => {
-  if (!requireConfig(res)) return;
+  if (!requirePaystack(res)) return;
   try {
-    const { service_code: rawCode, title } = req.body || {};
+    const { email, amount, service_code: rawCode, title, student_id } = req.body || {};
     const code = serviceCode(rawCode);
-    if (!['RESULT_ACCESS', 'ID_CARD'].includes(code)) {
-      return res.status(400).json({ error: 'Invalid service.' });
-    }
+    const requestedAmount = Number(amount);
 
-    const studentResult = await getStudent(req);
-    if (studentResult.error) return res.status(401).json({ error: studentResult.error });
-    const { user, student } = studentResult;
+    if (!email || !String(email).includes('@')) return res.status(400).json({ error: 'A valid payment email is required.' });
+    if (!allowedServices.has(code)) return res.status(400).json({ error: 'Invalid service.' });
+    if (!Number.isFinite(requestedAmount) || requestedAmount <= 0) return res.status(400).json({ error: 'Invalid payment amount.' });
 
-    const { data: setting, error: settingError } = await supabase
-      .from('student_service_settings')
-      .select('title,amount,is_active')
-      .eq('service_code', code)
-      .maybeSingle();
-
-    if (settingError) return res.status(500).json({ error: settingError.message });
-    if (!setting?.is_active) return res.status(400).json({ error: 'This service is not currently available.' });
-
-    // The server is the source of truth for pricing. The browser does not send
-    // an amount, so clients cannot change the configured service price.
-    const requestedAmount = Number(setting.amount);
-    if (!Number.isFinite(requestedAmount) || requestedAmount <= 0) {
-      return res.status(500).json({ error: 'This service has an invalid configured payment amount.' });
-    }
-
-    const { data: existing } = await supabase
-      .from('student_service_payments')
-      .select('reference,status')
-      .eq('student_id', student.id)
-      .eq('service_code', code)
-      .eq('status', 'PAID')
-      .limit(1)
-      .maybeSingle();
-
-    if (existing) return res.json({ paid: true, reference: existing.reference, amount: requestedAmount });
-
-    const email = student.school_email || student.guardian_email || user.email;
-    if (!email) return res.status(400).json({ error: 'No student payment email is available.' });
-
-    const reference = `LBS-${code}-${student.student_id}-${crypto.randomUUID().slice(0, 8)}`;
+    const reference = `LBS-${code}-${crypto.randomUUID().slice(0, 8)}`;
     const { response, payload } = await paystack('/transaction/initialize', {
       method: 'POST',
       body: JSON.stringify({
-        email,
+        email: String(email).trim(),
         amount: Math.round(requestedAmount * 100),
         currency: 'NGN',
         reference,
         callback_url: APP_URL || undefined,
         metadata: {
-          student_id: student.id,
-          student_number: student.student_id,
+          student_id: student_id || null,
           service_code: code,
-          service_title: title || setting.title,
+          service_title: title || (code === 'ID_CARD' ? 'Student ID Card' : 'Result Access'),
           service_amount: requestedAmount
         }
       })
@@ -180,28 +237,33 @@ app.post('/payments/initialize', async (req, res) => {
       return res.status(502).json({ error: payload.message || 'Paystack initialization failed.' });
     }
 
-    const { error: insertError } = await supabase.from('student_service_payments').insert({
-      student_id: student.id,
-      service_code: code,
-      amount: requestedAmount,
-      currency: 'NGN',
-      reference,
-      status: 'PENDING',
-      provider: 'PAYSTACK',
-      metadata: {
-        access_code: payload.data?.access_code || null,
-        authorization_url: payload.data?.authorization_url || null,
-        paystack_reference: payload.data?.reference || reference
+    let supabase_synced = false;
+    try {
+      if (student_id) {
+        await syncPendingPayment({
+          reference,
+          service_code: code,
+          student_id,
+          amount: requestedAmount,
+          currency: 'NGN',
+          metadata: {
+            access_code: payload.data?.access_code || null,
+            authorization_url: payload.data?.authorization_url || null
+          }
+        });
+        supabase_synced = true;
       }
-    });
-    if (insertError) return res.status(500).json({ error: insertError.message });
+    } catch (error) {
+      console.error('Post-Paystack Supabase sync failed:', error);
+    }
 
     res.json({
       paid: false,
       reference,
       access_code: payload.data?.access_code || null,
       authorization_url: payload.data?.authorization_url || null,
-      amount: requestedAmount
+      amount: requestedAmount,
+      supabase_synced
     });
   } catch (error) {
     console.error(error);
@@ -209,65 +271,80 @@ app.post('/payments/initialize', async (req, res) => {
   }
 });
 
+// Verify with Paystack first. Only after Paystack confirms success do we write
+// the PAID record that triggers the Supabase receipt publication.
 app.post('/payments/verify', async (req, res) => {
-  if (!requireConfig(res)) return;
+  if (!requirePaystack(res)) return;
   try {
-    const reference = String(req.body?.reference || '');
-    if (!reference) return res.status(400).json({ error: 'Payment reference is required.' });
+    const { reference, student_id, service_code: rawCode } = req.body || {};
+    const ref = String(reference || '').trim();
+    const code = serviceCode(rawCode);
+    if (!ref) return res.status(400).json({ error: 'Payment reference is required.' });
+    if (!allowedServices.has(code)) return res.status(400).json({ error: 'Invalid service.' });
 
-    const studentResult = await getStudent(req);
-    if (studentResult.error) return res.status(401).json({ error: studentResult.error });
-    const { student } = studentResult;
-
-    const { data: payment, error: paymentError } = await supabase
-      .from('student_service_payments')
-      .select('id,student_id,service_code,amount,currency,status,metadata')
-      .eq('reference', reference)
-      .eq('student_id', student.id)
-      .maybeSingle();
-
-    if (paymentError) return res.status(500).json({ error: paymentError.message });
-    if (!payment) return res.status(404).json({ error: 'Payment reference not found.' });
-
-    const { response, payload } = await paystack(`/transaction/verify/${encodeURIComponent(reference)}`);
+    const { response, payload } = await paystack(`/transaction/verify/${encodeURIComponent(ref)}`);
     const transaction = payload?.data || {};
     const paystackStatus = String(transaction.status || '').toLowerCase();
-    const amountOk = Number(transaction.amount) >= Math.round(Number(payment.amount) * 100);
+    const amountOk = Number(transaction.amount) > 0;
     const success = response.ok && payload.status === true && paystackStatus === 'success' && amountOk && transaction.currency === 'NGN';
     const terminalFailure = ['failed', 'abandoned', 'reversed'].includes(paystackStatus);
 
-    const metadata = {
-      ...(payment.metadata || {}),
-      paystack: transaction,
-      verified: success || terminalFailure,
-      verified_at: new Date().toISOString()
-    };
-
-    const update = { metadata };
-    if (success) {
-      update.status = 'PAID';
-      update.paid_at = new Date().toISOString();
-    } else if (terminalFailure) {
-      update.status = 'FAILED';
-      update.paid_at = null;
+    if (!success) {
+      return res.json({
+        paid: false,
+        reference: ref,
+        status: terminalFailure ? 'FAILED' : 'PENDING',
+        paystack_status: paystackStatus || null,
+        supabase_synced: false,
+        receipt_published: false
+      });
     }
 
-    const { error: updateError } = await supabase
-      .from('student_service_payments')
-      .update(update)
-      .eq('id', payment.id);
-
-    if (updateError) return res.status(500).json({ error: updateError.message });
+    const synced = await syncSuccessfulPayment({
+      reference: ref,
+      transaction,
+      student_id,
+      service_code: code
+    });
 
     res.json({
-      paid: success,
-      reference,
-      status: success ? 'PAID' : terminalFailure ? 'FAILED' : 'PENDING',
-      receipt_published: success
+      paid: true,
+      reference: ref,
+      status: 'PAID',
+      supabase_synced: synced.synced,
+      receipt_published: synced.receipt_published
     });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: 'Could not verify payment.' });
+    res.status(500).json({ error: error.message || 'Could not verify payment.' });
+  }
+});
+
+// Fetch the published Supabase receipt only for the currently authenticated
+// student. This keeps receipt retrieval behind the student's Supabase session.
+app.post('/payments/receipt', async (req, res) => {
+  try {
+    if (!supabase) return res.status(503).json({ error: 'Supabase receipt service is not configured.' });
+    const studentResult = await getAuthenticatedStudent(req);
+    if (studentResult.error) return res.status(401).json({ error: studentResult.error });
+
+    const reference = String(req.body?.reference || '').trim();
+    if (!reference) return res.status(400).json({ error: 'Payment reference is required.' });
+
+    const { data: receipt, error } = await supabase
+      .from('student_payment_receipts')
+      .select('*')
+      .eq('student_id', studentResult.student.id)
+      .eq('payment_reference', reference)
+      .maybeSingle();
+
+    if (error) return res.status(500).json({ error: error.message });
+    if (!receipt) return res.status(404).json({ error: 'Payment receipt not found.' });
+
+    res.json({ receipt });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Could not fetch payment receipt.' });
   }
 });
 
