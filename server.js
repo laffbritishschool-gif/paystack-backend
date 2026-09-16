@@ -10,7 +10,6 @@ const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const APP_URL = process.env.APP_URL || '';
 
 if (!PAYSTACK_SECRET_KEY) console.warn('Missing PAYSTACK_SECRET_KEY.');
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) console.warn('Supabase receipt sync is not configured.');
@@ -167,6 +166,8 @@ async function fetchReceipt(reference, student_id) {
 app.get('/', (_req, res) => res.json({ service: 'Laff British School Paystack Backend', status: 'ok' }));
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
+// Paystack sends the webhook with a raw JSON body. Keep this route before
+// express.json() so the HMAC signature is calculated from the exact body.
 app.post('/webhooks/paystack', express.raw({ type: 'application/json' }), async (req, res) => {
   if (!requirePaystack(res)) return;
   try {
@@ -208,6 +209,9 @@ app.post('/webhooks/paystack', express.raw({ type: 'application/json' }), async 
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
+// Paystack is the first payment call. Supabase sync happens only after
+// Paystack accepts the transaction, and no callback redirect is used for
+// Popup V2. The browser keeps control of the checkout page.
 app.post('/payments/initialize', async (req, res) => {
   if (!requirePaystack(res)) return;
   try {
@@ -227,7 +231,6 @@ app.post('/payments/initialize', async (req, res) => {
         amount: Math.round(requestedAmount * 100),
         currency: 'NGN',
         reference,
-        callback_url: APP_URL || undefined,
         metadata: {
           student_id: student_id || null,
           service_code: code,
@@ -237,7 +240,9 @@ app.post('/payments/initialize', async (req, res) => {
       })
     });
 
-    if (!response.ok || !payload.status) return res.status(502).json({ error: payload.message || 'Paystack initialization failed.' });
+    if (!response.ok || !payload.status) {
+      return res.status(502).json({ error: payload.message || 'Paystack initialization failed.' });
+    }
 
     let supabase_synced = false;
     try {
@@ -295,6 +300,8 @@ app.post('/payments/verify', async (req, res) => {
         reference: ref,
         status: terminalFailure ? 'FAILED' : 'PENDING',
         paystack_status: paystackStatus || null,
+        gateway_response: transaction.gateway_response || null,
+        response_code: transaction.response_code || null,
         supabase_synced: false,
         receipt_published: false
       });
