@@ -167,23 +167,33 @@ async function syncSuccessfulPayment({ reference, transaction, student_id, servi
 
 async function markReversed(payment, transaction, reason = 'Paystack reported a reversed charge.') {
   if (!supabase || !payment?.id) return null;
-  const metadata = {
+  const mergedMetadata = {
     ...(payment.metadata || {}),
-    paystack: transaction || payment.metadata?.paystack || null,
+    ...(transaction ? { paystack: transaction } : {}),
     reversed: true,
     reversed_at: new Date().toISOString(),
     reversal_reason: reason
   };
   const { error } = await supabase
     .from('student_service_payments')
-    .update({ status: 'REVERSED', metadata, updated_at: new Date().toISOString() })
+    .update({ status: 'REVERSED', metadata: mergedMetadata, updated_at: new Date().toISOString() })
     .eq('id', payment.id);
   if (error) throw error;
 
-  await supabase
-    .from('student_payment_receipts')
-    .update({ status: 'REVERSED', receipt_data: { ...(payment.metadata || {}), reversed: true, reversal_reason: reason }, updated_at: new Date().toISOString() })
-    .eq('payment_id', payment.id);
+  const { data: existingReceipt } = await supabase.from('student_payment_receipts')
+    .select('receipt_data').eq('payment_id', payment.id).order('created_at', { ascending: false }).limit(1).maybeSingle();
+  if (existingReceipt) {
+    await supabase.from('student_payment_receipts').update({
+      status: 'REVERSED',
+      receipt_data: {
+        ...(existingReceipt.receipt_data || {}),
+        reversed: true,
+        reversal_reason: reason,
+        reversed_at: new Date().toISOString()
+      },
+      updated_at: new Date().toISOString()
+    }).eq('payment_id', payment.id);
+  }
 
   return { reversed: true, payment_id: payment.id };
 }
@@ -271,8 +281,8 @@ async function listStudentTransactions(studentId) {
   if (legacyError) console.warn('Legacy transactions query failed:', legacyError.message);
   if (serviceError) console.warn('Service transactions query failed:', serviceError.message);
   const rows = [
-    ...(legacy || []).map(r => ({ ...r, source: 'School fees', currency: 'NGN' })),
-    ...(service || []).map(r => ({ ...r, source: 'Student service' }))
+    ...(legacy || []).filter(r => r.status !== 'CANCELLED').map(r => ({ ...r, source: 'School fees', currency: 'NGN' })),
+    ...(service || []).filter(r => r.status !== 'CANCELLED').map(r => ({ ...r, source: 'Student service' }))
   ];
   const normalized = [];
   for (const row of rows) normalized.push(await normalizeTransaction(row));
